@@ -630,6 +630,9 @@ static void clear_shrinker_bit(struct mem_cgroup *memcg, int nid, int i)
 {
 	struct memcg_shrinker_map *map;
 
+	if (unlikely(!memcg))
+		return;
+
 	rcu_read_lock();
 	map = rcu_dereference(memcg->nodeinfo[nid]->shrinker_map);
 	if (likely(map))
@@ -643,7 +646,7 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
 	unsigned long ret, freed = 0;
 	int index = 0;
 
-	if (!mem_cgroup_online(memcg))
+	if (!memcg || !mem_cgroup_online(memcg))
 		return 0;
 
 	while (index < READ_ONCE(shrinker_nr_max)) {
@@ -763,7 +766,7 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 	 * shrink, but skip global shrink.  This may result in premature
 	 * oom.
 	 */
-	if (!mem_cgroup_disabled() && !mem_cgroup_is_root(memcg))
+	if (!mem_cgroup_disabled() && memcg && !mem_cgroup_is_root(memcg))
 		return shrink_slab_memcg(gfp_mask, nid, memcg, priority);
 
 	read_lock(&shrinker_rwlock);
@@ -4086,13 +4089,19 @@ static int kshrinkd(void *pgdat)
 
 		/* Shrink slabs on both kswapd and direct reclaimers' behalf */
 		while (1) {
-			struct mem_cgroup *memcg = NULL;
+			struct mem_cgroup *memcg;
 
+			memcg = mem_cgroup_iter(NULL, NULL, NULL);
 			do {
 				shrink_slab(GFP_KERNEL, p->node_id, memcg, pri);
-			} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+				if (unlikely(kthread_should_stop())) {
+					mem_cgroup_iter_break(NULL, memcg);
+					break;
+				}
+			} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)) != NULL);
 
-			if (!atomic_long_read(&kshrinkd_waiters))
+			if (unlikely(kthread_should_stop()) ||
+			    !atomic_long_read(&kshrinkd_waiters))
 				break;
 
 			/* Iterate down each possible priority and then wrap */
