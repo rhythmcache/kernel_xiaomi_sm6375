@@ -20,6 +20,7 @@ on:
   push:
     branches:
       - main
+      - memcg-fix
     paths-ignore:
       - '**.md'
       - '.gitignore'
