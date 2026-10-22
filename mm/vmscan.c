@@ -206,29 +206,37 @@ static DEFINE_RWLOCK(shrinker_rwlock);
 
 static DEFINE_IDR(shrinker_idr);
 static int shrinker_nr_max;
+static DEFINE_MUTEX(shrinker_alloc_mutex);
 
 static int prealloc_memcg_shrinker(struct shrinker *shrinker)
 {
 	int id, ret = -ENOMEM;
 
-	down_write(&shrinker_rwsem);
-	/* This may call shrinker, so it must use down_read_trylock() */
-	id = idr_alloc(&shrinker_idr, SHRINKER_REGISTERING, 0, 0, GFP_KERNEL);
+	mutex_lock(&shrinker_alloc_mutex);
+	idr_preload(GFP_KERNEL);
+	spin_lock(&shrinker_lock);
+	id = idr_alloc(&shrinker_idr, SHRINKER_REGISTERING, 0, 0, GFP_NOWAIT);
+	spin_unlock(&shrinker_lock);
+	idr_preload_end();
 	if (id < 0)
 		goto unlock;
 
 	if (id >= shrinker_nr_max) {
 		if (memcg_expand_shrinker_maps(id)) {
+			spin_lock(&shrinker_lock);
+			write_lock(&shrinker_rwlock);
 			idr_remove(&shrinker_idr, id);
+			write_unlock(&shrinker_rwlock);
+			spin_unlock(&shrinker_lock);
 			goto unlock;
 		}
 
-		shrinker_nr_max = id + 1;
+		WRITE_ONCE(shrinker_nr_max, id + 1);
 	}
 	shrinker->id = id;
 	ret = 0;
 unlock:
-	up_write(&shrinker_rwsem);
+	mutex_unlock(&shrinker_alloc_mutex);
 	return ret;
 }
 
@@ -238,9 +246,11 @@ static void unregister_memcg_shrinker(struct shrinker *shrinker)
 
 	BUG_ON(id < 0);
 
-	down_write(&shrinker_rwsem);
+	spin_lock(&shrinker_lock);
+	write_lock(&shrinker_rwlock);
 	idr_remove(&shrinker_idr, id);
-	up_write(&shrinker_rwsem);
+	write_unlock(&shrinker_rwlock);
+	spin_unlock(&shrinker_lock);
 }
 
 static bool global_reclaim(struct scan_control *sc)
@@ -460,8 +470,6 @@ void unregister_shrinker(struct shrinker *shrinker)
 {
 	if (!shrinker->nr_deferred)
 		return;
-	if (shrinker->flags & SHRINKER_MEMCG_AWARE)
-		unregister_memcg_shrinker(shrinker);
 
 	/*
 	 * Wait until the shrinker is no longer in use (shrinker->del_rwsem)
@@ -472,6 +480,10 @@ void unregister_shrinker(struct shrinker *shrinker)
 	spin_lock(&shrinker_lock);
 	write_lock(&shrinker_rwlock);
 	list_del(&shrinker->list);
+#ifdef CONFIG_MEMCG
+	if (shrinker->flags & SHRINKER_MEMCG_AWARE)
+		idr_remove(&shrinker_idr, shrinker->id);
+#endif
 	write_unlock(&shrinker_rwlock);
 	spin_unlock(&shrinker_lock);
 	up_write(&shrinker->del_rwsem);
@@ -614,47 +626,74 @@ static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 }
 
 #ifdef CONFIG_MEMCG
+static void clear_shrinker_bit(struct mem_cgroup *memcg, int nid, int i)
+{
+	struct memcg_shrinker_map *map;
+
+	rcu_read_lock();
+	map = rcu_dereference(memcg->nodeinfo[nid]->shrinker_map);
+	if (likely(map))
+		clear_bit(i, map->map);
+	rcu_read_unlock();
+}
+
 static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
 			struct mem_cgroup *memcg, int priority)
 {
-	struct memcg_shrinker_map *map;
 	unsigned long ret, freed = 0;
-	int i;
+	int index = 0;
 
 	if (!mem_cgroup_online(memcg))
 		return 0;
 
-	if (!down_read_trylock(&shrinker_rwsem))
-		return 0;
-
-	map = rcu_dereference_protected(memcg->nodeinfo[nid]->shrinker_map,
-					true);
-	if (unlikely(!map))
-		goto unlock;
-
-	for_each_set_bit(i, map->map, shrinker_nr_max) {
+	while (index < READ_ONCE(shrinker_nr_max)) {
 		struct shrink_control sc = {
 			.gfp_mask = gfp_mask,
 			.nid = nid,
 			.memcg = memcg,
 		};
+		struct memcg_shrinker_map *map;
 		struct shrinker *shrinker;
+		int i;
 
+		rcu_read_lock();
+		map = rcu_dereference(memcg->nodeinfo[nid]->shrinker_map);
+		if (unlikely(!map)) {
+			rcu_read_unlock();
+			break;
+		}
+		i = find_next_bit(map->map, READ_ONCE(shrinker_nr_max), index);
+		rcu_read_unlock();
+
+		if (i >= READ_ONCE(shrinker_nr_max))
+			break;
+		index = i + 1;
+
+		read_lock(&shrinker_rwlock);
 		shrinker = idr_find(&shrinker_idr, i);
 		if (unlikely(!shrinker || shrinker == SHRINKER_REGISTERING)) {
+			read_unlock(&shrinker_rwlock);
 			if (!shrinker)
-				clear_bit(i, map->map);
+				clear_shrinker_bit(memcg, nid, i);
 			continue;
 		}
 
 		/* Call non-slab shrinkers even though kmem is disabled */
 		if (!memcg_kmem_enabled() &&
-		    !(shrinker->flags & SHRINKER_NONSLAB))
+		    !(shrinker->flags & SHRINKER_NONSLAB)) {
+			read_unlock(&shrinker_rwlock);
 			continue;
+		}
+
+		if (!down_read_trylock(&shrinker->del_rwsem)) {
+			read_unlock(&shrinker_rwlock);
+			continue;
+		}
+		read_unlock(&shrinker_rwlock);
 
 		ret = do_shrink_slab(&sc, shrinker, priority);
 		if (ret == SHRINK_EMPTY) {
-			clear_bit(i, map->map);
+			clear_shrinker_bit(memcg, nid, i);
 			/*
 			 * After the shrinker reported that it had no objects to
 			 * free, but before we cleared the corresponding bit in
@@ -678,14 +717,8 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
 				memcg_set_shrinker_bit(memcg, nid, i);
 		}
 		freed += ret;
-
-		if (rwsem_is_contended(&shrinker_rwsem)) {
-			freed = freed ? : 1;
-			break;
-		}
+		up_read(&shrinker->del_rwsem);
 	}
-unlock:
-	up_read(&shrinker_rwsem);
 	return freed;
 }
 #else /* CONFIG_MEMCG */
